@@ -11,8 +11,8 @@ import scipy.stats as stats
 import sunode
 import sunode.wrappers.as_theano
 import theano
-
-
+import theano.tensor as tt
+import datetime as dt
 
 """
 ---------------------------------------------------------------------------------
@@ -22,11 +22,42 @@ Define functions
 # Data extraction function:
 def COVID_data(daterange):
     raw_data = pd.read_csv("data/cases/data_2021-Jul-13.csv") # 'newCasesByPublishDate'
-    raw_data['date_new'] = pd.to_datetime(raw_data['date'])
-    raw_data = raw_data.sort_values(by='date_new' , axis='index')
-    cases = raw_data[['newCasesByPublishDate','date_new']]
+    raw_data['date_new'] = pd.to_datetime(raw_data['date'])         # coerces date column to datetime
+    raw_data = raw_data.sort_values(by='date_new' , axis='index')   # sorts so that earliest date appears first
+    cases = raw_data[['newCasesByPublishDate','date_new']]          # makes dataframe of date and cases columns
+    cases = cases.reset_index()
     return cases
 
+def infectious_duration(tau):
+    if tau.__class__ == pm.model.FreeRV:
+        res = tau.get_test_value()
+    else:
+        res = tau
+    return res
+
+def get_initial_I(tau, covid_obj):
+    I_initial = np.sum(covid_obj.iloc[(covid_obj.index[covid_obj.date_new==daterange[0]].values[0] - infectious_duration(tau)) : covid_obj.index[covid_obj.date_new==daterange[0]].values[0]+1]['newCasesByPublishDate'])
+    # I0 = pd.Series(I_initial)
+    # I0.name = 'I0'
+    # I0 = covid_obj.loc[(covid_obj['date_new'] > starttime - dt.timedelta(days=tau)) & (covid_obj['date_new'] <= starttime)]['newCasesByPublishDate']
+    return I_initial
+
+def get_cases_obs(tau, covid_obj):
+    cases_obs = covid_obj.iloc[ \
+                (covid_obj.index[covid_obj.date_new == daterange[0]].values[0] - infectious_duration(tau)) : covid_obj.index[covid_obj.date_new == daterange[-1]].values[0]+1] \
+                    ['newCasesByPublishDate']
+    cases_obs.name = 'cases_obs'
+    return cases_obs
+
+def get_cases_obs_movtautot(tau, covid_obj):
+    cases_obs = get_cases_obs(tau, covid_obj)
+    cases_obs_tmp = np.trim_zeros( \
+            [np.sum(cases_obs[idx-infectious_duration(tau):idx+1]) for idx,i in enumerate(cases_obs)] \
+                , trim='f')
+    # cases_obs_movtautot = pd.Series(cases_obs_tmp)
+    cases_obs_movtautot = pd.Series(cases_obs_tmp)
+    cases_obs_movtautot.name = 'cases_obs_movtautot'
+    return cases_obs_movtautot
 
 # Modelfunction defined according to sunode conventions:
 def SIR_sunode(t, y, p):
@@ -43,26 +74,34 @@ n_samples = 500
 n_tune = 100
 daterange = pd.date_range(start="2020-08-26", end="2020-11-13")
 covid_obj = COVID_data(daterange)                                       # Make a function to extract case data when given a country code argument
+# endtime = dt.date(2020,11,13)
+# starttime = dt.date(2020,8,26)
+# test_tau = dt.timedelta(days=10)
 
 N = 67000000                                                        # Population of UK
-I_init_date_mask = (covid_obj['date_new'] > (daterange[0]-11*daterange.freq)) & (covid_obj['date_new'] <= daterange[0]) # Past 10 days of cases considered to be infectious
-I_start_est = np.sum(covid_obj.loc[I_init_date_mask]['newCasesByPublishDate'])       # Initial number of infected at the start of the wave (take as case numbers for the prior 7 days to 26 Aug)
-not_S_date_mask = (covid_obj['date_new']<= daterange[0])                           # Assumes all prior cases are immune, deceased or infectious
-S_start_est = N - np.sum(covid_obj.loc[not_S_date_mask]['newCasesByPublishDate'])   # S(0) can be estimated as N - I(0) i.e. total number of people minus those infected at the start of the pandemic
-wave_date_mask = (covid_obj['date_new'] >= daterange[0]) & (covid_obj['date_new'] <= daterange[-1])
-cases_obs = covid_obj.loc[wave_date_mask]['newCasesByPublishDate']
-cases_obs_scaled = [((x - np.average(cases_obs)) / np.std(cases_obs)) for x in cases_obs]   # Standardises daily case counts for the wave
-I_start_est_scaled = (I_start_est - np.average(cases_obs)) / np.std(cases_obs)
-S_start_est_scaled = (S_start_est - np.average(cases_obs)) / np.std(cases_obs)
+tau = 10                                                            # days of infectiousness
+I_initial = get_initial_I(tau, covid_obj) /N
+S_initial = (N - np.sum(covid_obj.loc[covid_obj['date_new']<= daterange[0]]['newCasesByPublishDate']) )/N
+cases_obs = get_cases_obs_movtautot(tau, covid_obj) /N
+
+# I_init_date_mask = (covid_obj['date_new'] > (daterange[0]-11*daterange.freq)) & (covid_obj['date_new'] <= daterange[0]) # Past 10 days of cases considered to be infectious
+# I_start_est = np.sum(covid_obj.loc[I_init_date_mask]['newCasesByPublishDate'])       # Initial number of infected at the start of the wave (take as case numbers for the prior 7 days to 26 Aug)
+# not_S_date_mask = (covid_obj['date_new']<= daterange[0])                           # Assumes all prior cases are immune, deceased or infectious
+# S_start_est = N - np.sum(covid_obj.loc[not_S_date_mask]['newCasesByPublishDate'])   # S(0) can be estimated as N - I(0) i.e. total number of people minus those infected at the start of the pandemic
+# wave_date_mask = (covid_obj['date_new'] >= daterange[0]) & (covid_obj['date_new'] <= daterange[-1])
+# cases_obs = covid_obj.loc[wave_date_mask]['newCasesByPublishDate']
+# cases_obs_scaled = [((x - np.average(cases_obs)) / np.std(cases_obs)) for x in cases_obs]   # Standardises daily case counts for the wave
+# I_start_est_scaled = (I_start_est - np.average(cases_obs)) / np.std(cases_obs)
+# S_start_est_scaled = (S_start_est - np.average(cases_obs)) / np.std(cases_obs)
 likelihood = {'distribution': 'normal',
                 'sigma': 1}     # Is this valid?
-prior = {'beta': -1.5,
-            'beta_std': 1,
-            'lam': -1.5,
-            'lam_std': 1,
-            'S_init_mu': S_start_est_scaled,
+prior = {'beta': 1.0,
+            'beta_std': 1.0,
+            'lam': 0.5,
+            'lam_std': 0.2
+            # 'S_init_mu': S_start_est_scaled,
             # 'S_init_mu': 1,
-            'I_init_mu': I_start_est_scaled     # Both of these use the scale set by the observed case numbers
+            # 'I_init_mu': I_start_est_scaled     # Both of these use the scale set by the observed case numbers
         }
 
 
@@ -84,27 +123,40 @@ Perform SIDARTHE modelling on waves 1 and 2
 ----------------------------------------------------------------------------------
 """
 with pm.Model() as model:
+    # tau = pm.DiscreteUniform('tau', 7, 15)
+    # I_initial = pm.Deterministic('I_initial', get_initial_I(tau, covid_obj)/N) # Past tau days of cases considered to be infectious
+    # cases_obs = pm.Deterministic('cases_obs', get_cases_obs(tau, covid_obj)/N) 
+    # cases_obs = pm.Deterministic('cases_obs', cases_obs_ct / N)
+    # testing_movtautot = get_cases_obs_movtautot(tau, covid_obj)
+    # cases_obs_movtautot = pm.Deterministic('cases_obs_movtautot', get_cases_obs_movtautot(tau, covid_obj)/N)
+
     sigma = pm.HalfCauchy('sigma', likelihood['sigma'], shape=1)
     beta = pm.Lognormal('beta', prior['beta'], prior['beta_std'])       # lognormal might not be appropriate
     lam = pm.Lognormal('lambda', prior['lam'], prior['lam_std'])
-    # S_init_mu = pm.DiscreteUniform('S_init_mu', prior['S_init_mu']*0.99, prior['S_init_mu']*1.01)
-    S_init_mu = pm.Uniform('S_init_mu', -1,1)
-    # S_init_std = pm.Uniform('S_init_std', 0, prior['S_init_mu']*0.02)
-    S_init_std = pm.Constant('S_init_std', 1)
-    S_init = pm.Normal('S_init', mu=S_init_mu, sigma=S_init_std)
-    # I_init_std = pm.Uniform('I_init_std', prior['I_init_mu']*3, prior['I_init_mu']*2.4)
-    I_init_std = pm.Constant('I_init_std', 1)
-    # I_init_mu = pm.DiscreteUniform('I_init_mu', prior['I_init_mu']*1.2, prior['I_init_mu']*0.8)
-    I_init_mu = pm.Uniform('I_init_mu', -1, 1)
 
-    I_init = pm.Normal('I_init', mu=I_init_mu, sigma=I_init_std)
+    #I = pm.Normal('I', mu=res['I'], sigma=0.25)
+    # new_cases_t-tau = 
+    # new_cases_today = I - new_cases_yesterday - new_cases_daybefore - ... new_cases_taudaysago
+    
+
+    # S_init_mu = pm.DiscreteUniform('S_init_mu', prior['S_init_mu']*0.99, prior['S_init_mu']*1.01)
+    # S_init_mu = pm.Uniform('S_init_mu', 0.999,1)
+    # S_init_std = pm.Uniform('S_init_std', 0, prior['S_init_mu']*0.02)
+    # S_init_std = pm.Constant('S_init_std', 1)
+    # S_init = pm.Normal('S_init', mu=S_init_mu, sigma=S_init_std)
+    # I_init_std = pm.Uniform('I_init_std', prior['I_init_mu']*3, prior['I_init_mu']*2.4)
+    # I_init_std = pm.Constant('I_init_std', 1)
+    # I_init_mu = pm.DiscreteUniform('I_init_mu', prior['I_init_mu']*1.2, prior['I_init_mu']*0.8)
+    # I_init_mu = pm.Uniform('I_init_mu', -1, 1)
+
+    # I_init = pm.Normal('I_init', mu=I_init_mu, sigma=I_init_std)
 
     
     # ae.mode='DebugMode'
 
     res, _, problem, solver, _, _ = sunode.wrappers.as_theano.solve_ivp(
         y0={
-        'S': (S_init, ()), 'I': (I_init, ()),},  
+        'S': (S_initial, ()), 'I': (I_initial, ()),},  
         params={
         'beta': (beta, ()), 'lam': (lam, ()), '_dummy': (np.array(1.), ())},
         rhs=SIR_sunode,
@@ -115,7 +167,7 @@ with pm.Model() as model:
     #if(likelihood['distribution'] == 'lognormal'):
     #    I = pm.Lognormal('I', mu=res['I'], sigma=sigma, observed=cases_obs_scaled)
     #elif(likelihood['distribution'] == 'normal'):
-    I = pm.Normal('I', mu=res['I'], sigma=0.25, observed=cases_obs_scaled)
+    I = pm.Normal('I', mu=res['I'], sigma=0.125, observed=cases_obs)
     
     R0 = pm.Deterministic('R0',beta/lam)
 
