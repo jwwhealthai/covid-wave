@@ -70,8 +70,8 @@ def SIR_sunode(t, y, p):
 Configuration settings, parameter priors etc.
 ---------------------------------------------------------------------------------
 """
-n_samples = 500
-n_tune = 100
+n_samples = 1000
+n_tune = 200
 daterange = pd.date_range(start="2020-08-26", end="2020-11-13")
 covid_obj = COVID_data(daterange)                                       # Make a function to extract case data when given a country code argument
 # endtime = dt.date(2020,11,13)
@@ -130,7 +130,7 @@ with pm.Model() as model:
     # testing_movtautot = get_cases_obs_movtautot(tau, covid_obj)
     # cases_obs_movtautot = pm.Deterministic('cases_obs_movtautot', get_cases_obs_movtautot(tau, covid_obj)/N)
 
-    sigma = pm.HalfCauchy('sigma', likelihood['sigma'], shape=1)
+    sigma = pm.HalfCauchy('sigma', likelihood['sigma'])
     beta = pm.Lognormal('beta', prior['beta'], prior['beta_std'])       # lognormal might not be appropriate
     lam = pm.Lognormal('lambda', prior['lam'], prior['lam_std'])
 
@@ -167,8 +167,13 @@ with pm.Model() as model:
     #if(likelihood['distribution'] == 'lognormal'):
     #    I = pm.Lognormal('I', mu=res['I'], sigma=sigma, observed=cases_obs_scaled)
     #elif(likelihood['distribution'] == 'normal'):
-    I = pm.Normal('I', mu=res['I'], sigma=0.125, observed=cases_obs)
-    
+
+    I = pm.Normal('I', mu=res['I'], sigma=sigma, observed=cases_obs)
+
+    I_mu = pm.Deterministic('I_mu', res['I'])
+    S_mu = pm.Deterministic('S_mu', res['S'])
+    # R_mu = pm.Deterministic('R_mu', 1-S_mu-I)
+
     R0 = pm.Deterministic('R0',beta/lam)
 
     trace = pm.sample(n_samples, tune=n_tune, cores=1
@@ -185,11 +190,35 @@ with pm.Model() as model:
     #     'I_init': np.array([0.]) 
     #     }
     )
+    az.plot_autocorr(trace)
+    plt.show()
     az.plot_trace(trace)
-plt.show()
-print('this is the end')
+    plt.show()
+burned_trace = trace[int(n_samples/4):]
 """
 ----------------------------------------------------------------------------------
+Plotting
+----------------------------------------------------------------------------------
+"""
+param_samples = {'beta': burned_trace['beta'],\
+    'lambda': burned_trace['lambda'], \
+        'R0': burned_trace['R0'], \
+            'sigma': burned_trace['sigma']}
+expected_params = {}
+for k,v in param_samples.items():
+    expected_params[k]= np.sum(v)/len(v)
 
-----------------------------------------------------------------------------------
-"""
+# Extract I, S, R values as an average at each timepoint from the burned trace and plot with the observed I.
+Y = np.mean([burned_trace[y] for y in ['I_mu', 'S_mu']], axis=1)
+Y = [Y[0], Y[1], 1-Y[0]-Y[1]]
+# now plot using dates as x, and I, S and R on the y-axis (Y[0], Y[1] and Y[2])
+plt.plot(daterange, Y[0], "o--", label="I")
+plt.plot(daterange, Y[1], "o--", label="S")
+plt.plot(daterange, Y[2], "o--", label="R")
+plt.plot(daterange, cases_obs, "x--", label="I_obs")
+plt.ylim(0.000,1.0)
+plt.legend(fontsize=12)
+
+plt.show()
+
+print('this is the end')
