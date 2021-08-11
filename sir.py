@@ -1,5 +1,5 @@
-#import aesara as ae
-#import aesara.tensor as aet
+import aesara as ae
+import aesara.tensor as aet
 #import theano-pymc as tt
 import pymc3 as pm
 import pandas as pd
@@ -10,8 +10,9 @@ from matplotlib import pyplot as plt
 import scipy.stats as stats
 import sunode
 import sunode.wrappers.as_theano
-import theano
-import theano.tensor as tt
+import cloudpickle
+#import theano
+#import theano.tensor as tt
 import datetime as dt
 
 """
@@ -29,10 +30,10 @@ def COVID_data(daterange):
     return cases
 
 def infectious_duration(tau):
-    if tau.__class__ == pm.model.FreeRV:
-        res = tau.get_test_value()
-    else:
-        res = tau
+    # if isinstance(tau, (int,float)):
+    #     res = tau.get_test_value()
+    # else:
+    res = tau
     return res
 
 def get_initial_I(tau, covid_obj):
@@ -94,10 +95,10 @@ cases_obs = get_cases_obs_movtautot(tau, covid_obj) /N
 # I_start_est_scaled = (I_start_est - np.average(cases_obs)) / np.std(cases_obs)
 # S_start_est_scaled = (S_start_est - np.average(cases_obs)) / np.std(cases_obs)
 likelihood = {'distribution': 'normal',
-                'sigma': 1}     # Is this valid?
-prior = {'beta': 1.0,
-            'beta_std': 1.0,
-            'lam': 0.5,
+                'sigma': 0.003}     # Is this valid?
+prior = {'beta': 2.0,
+            'beta_std': 0.5,
+            'lam': 2.0,
             'lam_std': 0.2
             # 'S_init_mu': S_start_est_scaled,
             # 'S_init_mu': 1,
@@ -190,33 +191,32 @@ with pm.Model() as model:
     #     'I_init': np.array([0.]) 
     #     }
     )
-    az.plot_autocorr(trace)
+    pm.plot_autocorr(trace)
     plt.show()
-    az.plot_trace(trace)
+    pm.plot_trace(trace)
     plt.show()
-burned_trace = trace[int(n_samples/4):]
+burned_trace = trace.isel(draw=slice(int(n_samples/4),-1))
 """
 ----------------------------------------------------------------------------------
 Plotting
 ----------------------------------------------------------------------------------
 """
-param_samples = {'beta': burned_trace['beta'],\
-    'lambda': burned_trace['lambda'], \
-        'R0': burned_trace['R0'], \
-            'sigma': burned_trace['sigma']}
-expected_params = {}
-for k,v in param_samples.items():
-    expected_params[k]= np.sum(v)/len(v)
-
 # Extract I, S, R values as an average at each timepoint from the burned trace and plot with the observed I.
-Y = np.mean([burned_trace[y] for y in ['I_mu', 'S_mu']], axis=1)
-Y = [Y[0], Y[1], 1-Y[0]-Y[1]]
+Y = [np.zeros(1), np.zeros(1), np.zeros(1)]
+arr = burned_trace.posterior.mean(dim="draw")
+arr['I_mu'] = arr.I_mu.rename({'chain':'chain', 'I_mu_dim_0':'days_since_origin'})
+arr['S_mu'] = arr.S_mu.rename({'chain':'chain', 'S_mu_dim_0':'days_since_origin'})
+Y[0] = arr['I_mu']
+Y[1] = arr['S_mu']
+Y[2] = 1-Y[0]-Y[1]
+# Yc = [  [ Y[y][c,:] for y in range(len(Y)) ] for c in range(2) ]
+
 # now plot using dates as x, and I, S and R on the y-axis (Y[0], Y[1] and Y[2])
-plt.plot(daterange, Y[0], "o--", label="I")
-plt.plot(daterange, Y[1], "o--", label="S")
-plt.plot(daterange, Y[2], "o--", label="R")
+plt.plot(daterange, Y[0][0], "o--", label="I")
+plt.plot(daterange, Y[1][0], "o--", label="S")
+plt.plot(daterange, Y[2][0], "o--", label="R")
 plt.plot(daterange, cases_obs, "x--", label="I_obs")
-plt.ylim(0.000,1.0)
+plt.ylim(0.000,0.1)
 plt.legend(fontsize=12)
 
 plt.show()
