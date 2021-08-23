@@ -177,7 +177,7 @@ with pm.Model() as model:
 
     R0 = pm.Deterministic('R0',beta/lam)
 
-    trace = pm.sample(n_samples, tune=n_tune, cores=1
+    trace = pm.sample(n_samples, chains=2, tune=n_tune, cores=2
     # mode='DebugMode', 
     # start={
     #     'sigma': np.array([0.]), 
@@ -191,10 +191,10 @@ with pm.Model() as model:
     #     'I_init': np.array([0.]) 
     #     }
     )
-    pm.plot_autocorr(trace)
-    plt.show()
-    pm.plot_trace(trace)
-    plt.show()
+    #pm.plot_autocorr(trace)
+    #plt.show()
+    #pm.plot_trace(trace)
+    #plt.show()
 burned_trace = trace.isel(draw=slice(int(n_samples/4),-1))
 """
 ----------------------------------------------------------------------------------
