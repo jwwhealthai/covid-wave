@@ -6,6 +6,8 @@ import pandas as pd
 import numpy as np
 import arviz as az
 #from IPython.core.pylabtools import figsize
+import matplotlib
+matplotlib.use('TkAgg')
 from matplotlib import pyplot as plt
 import scipy.stats as stats
 import sunode
@@ -63,16 +65,15 @@ def get_cases_obs_movtautot(tau, covid_obj):
 # Modelfunction defined according to sunode conventions:
 def SIR_sunode(t, y, p):
     return {
-        'S': -p.beta * y.S * y.I,
-        'I': p.beta * y.S * y.I - p.lam * y.I}
-
+        'S': -p.beta * y.S * y.I,               #Term1: Change due to new infections NB: assumes all infected become immune, otherwise wold require another term
+        'I': p.beta * y.S * y.I - p.lam * y.I}  #Term1: Change due to new infections; Term2: Change due to those no longer infected
 """
 ---------------------------------------------------------------------------------
 Configuration settings, parameter priors etc.
 ---------------------------------------------------------------------------------
 """
-n_samples = 1000
-n_tune = 200
+n_samples = 1200
+n_tune = 1000
 daterange = pd.date_range(start="2020-08-26", end="2020-11-13")
 covid_obj = COVID_data(daterange)                                       # Make a function to extract case data when given a country code argument
 # endtime = dt.date(2020,11,13)
@@ -95,10 +96,10 @@ cases_obs = get_cases_obs_movtautot(tau, covid_obj) /N
 # I_start_est_scaled = (I_start_est - np.average(cases_obs)) / np.std(cases_obs)
 # S_start_est_scaled = (S_start_est - np.average(cases_obs)) / np.std(cases_obs)
 likelihood = {'distribution': 'normal',
-                'sigma': 0.003}     # Is this valid?
-prior = {'beta': 2.0,
-            'beta_std': 0.5,
-            'lam': 2.0,
+                'sigma': 1.0}     # Is this valid?
+prior = {'beta': 1.0,
+            'beta_std': 1.0,
+            'lam': 0.5,
             'lam_std': 0.2
             # 'S_init_mu': S_start_est_scaled,
             # 'S_init_mu': 1,
@@ -177,7 +178,7 @@ with pm.Model() as model:
 
     R0 = pm.Deterministic('R0',beta/lam)
 
-    trace = pm.sample(n_samples, chains=2, tune=n_tune, cores=2
+    trace = pm.sample(n_samples, chains=2, tune=n_tune, cores=8
     # mode='DebugMode', 
     # start={
     #     'sigma': np.array([0.]), 
@@ -198,7 +199,7 @@ with pm.Model() as model:
 burned_trace = trace.isel(draw=slice(int(n_samples/4),-1))
 """
 ----------------------------------------------------------------------------------
-Plotting
+Plotting & Saving
 ----------------------------------------------------------------------------------
 """
 # Extract I, S, R values as an average at each timepoint from the burned trace and plot with the observed I.
@@ -220,5 +221,8 @@ plt.ylim(0.000,0.1)
 plt.legend(fontsize=12)
 
 plt.show()
+
+burned_trace.to_netcdf("burned_trace_output_saved_on_disk_run2.nc")
+Y[0].to_netcdf("I_output_saved_on_disk_run2.nc")
 
 print('this is the end')
