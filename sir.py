@@ -1,35 +1,37 @@
 import aesara as ae
 import aesara.tensor as aet
-#import theano-pymc as tt
 import pymc3 as pm
 import pandas as pd
 import numpy as np
 import arviz as az
-#from IPython.core.pylabtools import figsize
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib import pyplot as plt
-import scipy.stats as stats
-import sunode
-import sunode.wrappers.as_theano
-import cloudpickle
-#import theano
-#import theano.tensor as tt
-import datetime as dt
+import xarray as xa
+from netCDF4 import Dataset
 
 """
 ---------------------------------------------------------------------------------
-Define functions
+Define data wrangling functions
 ---------------------------------------------------------------------------------
 """
 # Data extraction function:
-def COVID_data(daterange):
-    raw_data = pd.read_csv("data/cases/data_2021-Jul-13.csv") # 'newCasesByPublishDate'
-    raw_data['date_new'] = pd.to_datetime(raw_data['date'])         # coerces date column to datetime
-    raw_data = raw_data.sort_values(by='date_new' , axis='index')   # sorts so that earliest date appears first
-    cases = raw_data[['newCasesByPublishDate','date_new']]          # makes dataframe of date and cases columns
+def COVID_case_data(daterange):
+    raw_data_c = pd.read_csv("data/cases/data_2021-Jul-13.csv") # 'newCasesByPublishDate'
+    raw_data_c['date_new'] = pd.to_datetime(raw_data_c['date'])         # coerces date column to datetime
+    raw_data_c = raw_data_c.sort_values(by='date_new' , axis='index')   # sorts so that earliest date appears first
+    cases = raw_data_c[['newCasesByPublishDate','date_new']]          # makes dataframe of date and cases columns
     cases = cases.reset_index()
     return cases
+
+def COVID_hosp_data(daterange):
+    raw_data_h = pd.read_csv("data/hosp/data_2021-Jun-17.csv") # 'newAdmissions'
+    raw_data_h['date_new'] = pd.to_datetime(raw_data_h['date'])         # coerces date column to datetime
+    raw_data_h = raw_data_h.sort_values(by='date_new' , axis='index')   # sorts so that earliest date appears first
+    tmp_data_h = raw_data_h.groupby(by=[raw_data_h.date_new], as_index=False).sum()     # groups 4 nations data by date and sums admissions
+    admissions = tmp_data_h[['newAdmissions','date_new']]          # makes dataframe of date and admissions columns
+    admissions = admissions.reset_index()
+    return admissions
 
 def infectious_duration(tau):
     # if isinstance(tau, (int,float)):
@@ -38,191 +40,181 @@ def infectious_duration(tau):
     res = tau
     return res
 
-def get_initial_I(tau, covid_obj):
-    I_initial = np.sum(covid_obj.iloc[(covid_obj.index[covid_obj.date_new==daterange[0]].values[0] - infectious_duration(tau)) : covid_obj.index[covid_obj.date_new==daterange[0]].values[0]+1]['newCasesByPublishDate'])
+def get_initial_I(tau, covid_case_obj, daterange):
+    I_initial = np.sum(covid_case_obj.iloc[(covid_case_obj.index[covid_case_obj.date_new==daterange[0]].values[0] - infectious_duration(tau)) : covid_case_obj.index[covid_case_obj.date_new==daterange[0]].values[0]+1]['newCasesByPublishDate'])
     # I0 = pd.Series(I_initial)
     # I0.name = 'I0'
-    # I0 = covid_obj.loc[(covid_obj['date_new'] > starttime - dt.timedelta(days=tau)) & (covid_obj['date_new'] <= starttime)]['newCasesByPublishDate']
+    # I0 = covid_case_obj.loc[(covid_case_obj['date_new'] > starttime - dt.timedelta(days=tau)) & (covid_case_obj['date_new'] <= starttime)]['newCasesByPublishDate']
     return I_initial
 
-def get_cases_obs(tau, covid_obj):
-    cases_obs = covid_obj.iloc[ \
-                (covid_obj.index[covid_obj.date_new == daterange[0]].values[0] - infectious_duration(tau)) : covid_obj.index[covid_obj.date_new == daterange[-1]].values[0]+1] \
-                    ['newCasesByPublishDate']
-    cases_obs.name = 'cases_obs'
-    return cases_obs
+def get_initial_H(tau, covid_hosp_obj, daterange):
+    H_initial = np.sum(covid_hosp_obj.iloc[(covid_hosp_obj.index[covid_hosp_obj.date_new==daterange[0]].values[0] - infectious_duration(tau)) : covid_hosp_obj.index[covid_hosp_obj.date_new==daterange[0]].values[0]+1]['newAdmissions'])
+    return H_initial
 
-def get_cases_obs_movtautot(tau, covid_obj):
-    cases_obs = get_cases_obs(tau, covid_obj)
-    cases_obs_tmp = np.trim_zeros( \
-            [np.sum(cases_obs[idx-infectious_duration(tau):idx+1]) for idx,i in enumerate(cases_obs)] \
-                , trim='f')
-    # cases_obs_movtautot = pd.Series(cases_obs_tmp)
-    cases_obs_movtautot = pd.Series(cases_obs_tmp)
-    cases_obs_movtautot.name = 'cases_obs_movtautot'
-    return cases_obs_movtautot
+"""
+---------------------------------------------------------------------------------
+Daily difference system which defines the model (SIHR)
+---------------------------------------------------------------------------------
+"""
+# Discretising the ODE model might yield significant speed-ups. Therefore make delta_t equal to 1 (i.e. time interval = 1 day).
+# This function will determine values for S, I and H given: beta, lambda, gamma and delta arguments (random variable priors) 
+# as well as initial S (a random variable prior), I (a RV prior), H (RV prior) and N (UK population, fixed).
 
-# Modelfunction defined according to sunode conventions:
-def SIR_sunode(t, y, p):
-    return {
-        'S': -p.beta * y.S * y.I,               #Term1: Change due to new infections NB: assumes all infected become immune, otherwise wold require another term
-        'I': p.beta * y.S * y.I - p.lam * y.I}  #Term1: Change due to new infections; Term2: Change due to those no longer infected
+def SIHR(beta, lam, gamma, delta, S_t_init, I_t_init, H_t_init):
+    I_new_init = aet.zeros_like(I_t_init)
+    H_new_init = aet.zeros_like(H_t_init)
+    def increment_t(beta, S_prev_t, I_prev_t, H_prev_t, temp1, temp2):
+        I_new = beta*S_prev_t*I_prev_t                  # all those with 'new' subscript only consider in-flows
+        H_new = gamma*I_prev_t
+        # S_new = 0                                       # assumes everyone becomes immune or perishes, noone returns to susceptibility 
+        I_t = I_new -lam*I_prev_t - H_new + I_prev_t
+        S_t = S_prev_t - I_new
+        H_t = H_new + H_prev_t - delta*H_prev_t
+        return S_t, I_t, H_t, I_new, H_new
+    # sequences is the 'list' that the theano loop iterates over similar to how python loops over an array len(array) times. Beta is a tensor of ndays elements with each taking the value of the current beta RV equiv.
+    # outputs_info accumulates results. It indicates to 'scan' that the results from the prior iteration for these variables need to be passed to increment_t.
+    outputs, _ = ae.scan(fn=increment_t, sequences=[beta], outputs_info=[S_t_init, I_t_init, H_t_init, I_new_init, H_new_init])
+    S_t_all, I_t_all, H_t_all, I_new_all, H_new_all = outputs
+    return S_t_all, I_t_all, H_t_all, I_new_all, H_new_all
+         
+
 """
 ---------------------------------------------------------------------------------
 Configuration settings, parameter priors etc.
 ---------------------------------------------------------------------------------
 """
-n_samples = 1200
-n_tune = 1000
 daterange = pd.date_range(start="2020-08-26", end="2020-11-13")
-covid_obj = COVID_data(daterange)                                       # Make a function to extract case data when given a country code argument
-# endtime = dt.date(2020,11,13)
-# starttime = dt.date(2020,8,26)
-# test_tau = dt.timedelta(days=10)
+ndays = len(daterange.day)
+covid_case_obj = COVID_case_data(daterange)                      # Make a function to extract case data when given a country code argument
+covid_hosp_obj = COVID_hosp_data(daterange)
 
-N = 67000000                                                        # Population of UK
-tau = 10                                                            # days of infectiousness
-I_initial = get_initial_I(tau, covid_obj) /N
-S_initial = (N - np.sum(covid_obj.loc[covid_obj['date_new']<= daterange[0]]['newCasesByPublishDate']) )/N
-cases_obs = get_cases_obs_movtautot(tau, covid_obj) /N
+n_samples = 1000
+n_tune = 1000
+N = 67000000                                                     # Population of UK
+tau = 10                                                         # Num days people remain in infectious compartment, used for rough estimate of I_initial from cases[0]
+I_initial = get_initial_I(tau, covid_case_obj, daterange) / N     # From observed data, takes the case numbers of the tau days prior to startdate.
+H_initial = get_initial_H(tau, covid_hosp_obj, daterange) / N     # From observed data, takes the admissions numbers of the tau days prior to startdate.
+# Prior estimate of R_initial sums all cases up to 10 days before start date.
+R_initial = np.sum(covid_case_obj.loc[covid_case_obj['date_new']<= daterange[0]-tau*daterange.freq]['newCasesByPublishDate']) / N
+S_initial = (N - R_initial - I_initial - H_initial) / N   # All cases removed before startdate-tau incl in R_initial. Infected or hospitalised cases within startdate-tau also need to subtracted.
+cases_obs = covid_case_obj.loc[(covid_case_obj['date_new'] >= daterange[0]) & (covid_case_obj['date_new'] < daterange[-1])]['newCasesByPublishDate'] / N
+hosp_admissions_obs = covid_hosp_obj.loc[(covid_hosp_obj['date_new'] >= daterange[0]) & (covid_hosp_obj['date_new'] < daterange[-1])]['newAdmissions'] / N
 
-# I_init_date_mask = (covid_obj['date_new'] > (daterange[0]-11*daterange.freq)) & (covid_obj['date_new'] <= daterange[0]) # Past 10 days of cases considered to be infectious
-# I_start_est = np.sum(covid_obj.loc[I_init_date_mask]['newCasesByPublishDate'])       # Initial number of infected at the start of the wave (take as case numbers for the prior 7 days to 26 Aug)
-# not_S_date_mask = (covid_obj['date_new']<= daterange[0])                           # Assumes all prior cases are immune, deceased or infectious
-# S_start_est = N - np.sum(covid_obj.loc[not_S_date_mask]['newCasesByPublishDate'])   # S(0) can be estimated as N - I(0) i.e. total number of people minus those infected at the start of the pandemic
-# wave_date_mask = (covid_obj['date_new'] >= daterange[0]) & (covid_obj['date_new'] <= daterange[-1])
-# cases_obs = covid_obj.loc[wave_date_mask]['newCasesByPublishDate']
-# cases_obs_scaled = [((x - np.average(cases_obs)) / np.std(cases_obs)) for x in cases_obs]   # Standardises daily case counts for the wave
-# I_start_est_scaled = (I_start_est - np.average(cases_obs)) / np.std(cases_obs)
-# S_start_est_scaled = (S_start_est - np.average(cases_obs)) / np.std(cases_obs)
-likelihood = {'distribution': 'normal',
-                'sigma': 1.0}     # Is this valid?
-prior = {'beta': 1.0,
-            'beta_std': 1.0,
-            'lam': 0.5,
-            'lam_std': 0.2
-            # 'S_init_mu': S_start_est_scaled,
-            # 'S_init_mu': 1,
-            # 'I_init_mu': I_start_est_scaled     # Both of these use the scale set by the observed case numbers
+prior = {   'beta_mu': (1.2),
+            'beta_sig': (0.15),
+            'gamma_mu': (0.4),
+            'gamma_sig': (0.02),
+            'delta_mu': (0.125),
+            'delta_sig': (0.02),
+            'lam_mu': (0.5),
+            'lam_sig': (0.05),
+            'S_t_init_mu': S_initial,
+            'S_t_init_sig': 0.05*(1-S_initial),
+            'I_t_init_mu': (I_initial),
+            'I_t_init_sig': I_initial*0.04,
+            'H_t_init_mu': (H_initial),
+            'H_t_init_sig': H_initial*0.04
         }
 
 
 """
 ----------------------------------------------------------------------------------
-Extract case data for UK, this will be the observed data for Diagnosed compartment
-----------------------------------------------------------------------------------
-"""
-
-# count_data = [raw_data[['newAdmissions', 'date']][raw_data['areaName']== \
-#     pd.unique(raw_data['areaName'])[i]] for i in range(0,4)]
-# count_data = [count_data[i].sort_values(by='date' , axis='index') for i in range(0,4)]
-# n_count_data = [len(count_data[i]) for i in range(0,4)]
-
-
-"""
-----------------------------------------------------------------------------------
-Perform SIDARTHE modelling on waves 1 and 2
+Perform SIHR modelling on waves 1 and 2
 ----------------------------------------------------------------------------------
 """
 with pm.Model() as model:
-    # tau = pm.DiscreteUniform('tau', 7, 15)
-    # I_initial = pm.Deterministic('I_initial', get_initial_I(tau, covid_obj)/N) # Past tau days of cases considered to be infectious
-    # cases_obs = pm.Deterministic('cases_obs', get_cases_obs(tau, covid_obj)/N) 
-    # cases_obs = pm.Deterministic('cases_obs', cases_obs_ct / N)
-    # testing_movtautot = get_cases_obs_movtautot(tau, covid_obj)
-    # cases_obs_movtautot = pm.Deterministic('cases_obs_movtautot', get_cases_obs_movtautot(tau, covid_obj)/N)
 
-    sigma = pm.HalfCauchy('sigma', likelihood['sigma'])
-    beta = pm.Lognormal('beta', prior['beta'], prior['beta_std'])       # lognormal might not be appropriate
-    lam = pm.Lognormal('lambda', prior['lam'], prior['lam_std'])
+    I_t_init = pm.Normal("I_t_init", prior['I_t_init_mu'], prior['I_t_init_sig'])
+    H_t_init = pm.Normal("H_t_init", prior['H_t_init_mu'], prior['H_t_init_sig'])
+    #R_t_init = pm.Normal("R_t_init", R_initial, R_initial*0.01)
+    #S_t_init_mu = pm.Deterministic("S_t_init_mu", 1-I_t_init-H_t_init-R_t_init)
+    S_t_init = pm.Normal("S_t_init", prior['S_t_init_mu'], prior['S_t_init_sig'])    # N is equal to 1, R will be > 0 if the daterange starts after the beginning of first wave
 
-    #I = pm.Normal('I', mu=res['I'], sigma=0.25)
-    # new_cases_t-tau = 
-    # new_cases_today = I - new_cases_yesterday - new_cases_daybefore - ... new_cases_taudaysago
-    
+    # sigma = pm.HalfCauchy('sigma', likelihood['sigma'])
+    # sigma_h = pm.HalfCauchy('sigma_h', likelihood['sigma_h'])
+    # H_sigma = pm.HalfCauchy('H_sigma', likelihood['H_sigma'])
+    beta = pm.Normal('beta', prior['beta_mu'], prior['beta_sig'])     # lognormal might not be appropriate
+    lam = pm.Normal('lambda', prior['lam_mu'], prior['lam_sig'])
+    gamma = pm.Normal('gamma', prior['gamma_mu'], prior['gamma_sig'])
+    delta = pm.Normal('delta', prior['delta_mu'], prior['delta_sig'])
+    # case_obs_err = pm.HalfCauchy('case_obs_err', beta=0.00005)    # RV for error in case collection figures
+    # adm_obs_err = pm.HalfCauchy('adm_obs_err', beta=0.000005)      # RV for error in hospital admissions figures
 
-    # S_init_mu = pm.DiscreteUniform('S_init_mu', prior['S_init_mu']*0.99, prior['S_init_mu']*1.01)
-    # S_init_mu = pm.Uniform('S_init_mu', 0.999,1)
-    # S_init_std = pm.Uniform('S_init_std', 0, prior['S_init_mu']*0.02)
-    # S_init_std = pm.Constant('S_init_std', 1)
-    # S_init = pm.Normal('S_init', mu=S_init_mu, sigma=S_init_std)
-    # I_init_std = pm.Uniform('I_init_std', prior['I_init_mu']*3, prior['I_init_mu']*2.4)
-    # I_init_std = pm.Constant('I_init_std', 1)
-    # I_init_mu = pm.DiscreteUniform('I_init_mu', prior['I_init_mu']*1.2, prior['I_init_mu']*0.8)
-    # I_init_mu = pm.Uniform('I_init_mu', -1, 1)
+    S, I, H, I_new, H_new = SIHR(beta=beta * aet.ones(ndays-1), lam=lam, 
+                                               gamma=gamma, delta=delta, S_t_init=S_t_init, I_t_init=I_t_init, 
+                                               H_t_init=H_t_init)
 
-    # I_init = pm.Normal('I_init', mu=I_init_mu, sigma=I_init_std)
 
-    
-    # ae.mode='DebugMode'
+# nu should be roughly equivalent to the (number of samples) / (number of days in the daterange) - 1
+    new_cases = pm.StudentT('new_cases', nu=4, mu=I_new, sigma=0.03*(I_new), observed=cases_obs)
+    new_admissions = pm.StudentT('new_admissions', nu=4, mu=H_new, sigma=0.03*(H_new), observed=hosp_admissions_obs)
 
-    res, _, problem, solver, _, _ = sunode.wrappers.as_theano.solve_ivp(
-        y0={
-        'S': (S_initial, ()), 'I': (I_initial, ()),},  
-        params={
-        'beta': (beta, ()), 'lam': (lam, ()), '_dummy': (np.array(1.), ())},
-        rhs=SIR_sunode,
-        tvals=daterange.dayofyear,
-        t0=daterange.dayofyear[0]
-    )
-
-    #if(likelihood['distribution'] == 'lognormal'):
-    #    I = pm.Lognormal('I', mu=res['I'], sigma=sigma, observed=cases_obs_scaled)
-    #elif(likelihood['distribution'] == 'normal'):
-
-    I = pm.Normal('I', mu=res['I'], sigma=sigma, observed=cases_obs)
-
-    I_mu = pm.Deterministic('I_mu', res['I'])
-    S_mu = pm.Deterministic('S_mu', res['S'])
-    # R_mu = pm.Deterministic('R_mu', 1-S_mu-I)
+    S = pm.Deterministic('S', S)
+    I = pm.Deterministic('I', I)
+    H = pm.Deterministic('H', H)
+    R = pm.Deterministic('R', 1-S-I-H)
+    I_new = pm.Deterministic('I_new', I_new)
+    H_new = pm.Deterministic('H_new', H_new)
 
     R0 = pm.Deterministic('R0',beta/lam)
 
-    trace = pm.sample(n_samples, chains=2, tune=n_tune, cores=8
-    # mode='DebugMode', 
-    # start={
-    #     'sigma': np.array([0.]), 
-    #     'beta': np.array([0.]), 
-    #     'lambda': np.array([0.]), 
-    #     'S_init_mu': np.array([0.]),
-    #     'S_init_std': np.array([0.]),
-    #     'S_init': np.array([0.]),
-    #     'I_init_mu': np.array([0.]),
-    #     'I_init_std': np.array([0.]),
-    #     'I_init': np.array([0.]) 
-    #     }
-    )
-    #pm.plot_autocorr(trace)
-    #plt.show()
-    #pm.plot_trace(trace)
-    #plt.show()
+    # Checks on priors (run first 4 lines within model, next 3 from debug console)
+    # RANDOM_SEED = 8157
+    # np.random.seed(286)
+    # prior_checks = pm.sample_prior_predictive(random_seed=RANDOM_SEED)      # takes a minute or so to run
+    # interdata_prior = az.from_pymc3(prior=prior_checks)
+    
+    # # _, ax = plt.subplots()
+    # # interdata_prior.prior.plot.scatter(x="new_admissions", y="adm_obs_err", ax=ax)
+    # # plt.show()
+
+    # Sampling
+    step = pm.Metropolis()
+    # step = pm.NUTS()    # still too slow
+    # step1 = pm.NUTS(adapt_step_size=False)
+    # trace = pm.sample(n_samples, step=step1, chains=2, tune=n_tune, cores=8 
+    trace = pm.sample(draws=n_samples, tune=n_tune, step=step, chains=2, cores=8)
+
+trace.to_netcdf("raw_discretised_05.nc")
 burned_trace = trace.isel(draw=slice(int(n_samples/4),-1))
+burned_trace.to_netcdf("discretised_05.nc")
+final_trace = burned_trace.isel(draw=slice(int(n_samples*.99),-1))
+
 """
 ----------------------------------------------------------------------------------
 Plotting & Saving
 ----------------------------------------------------------------------------------
 """
 # Extract I, S, R values as an average at each timepoint from the burned trace and plot with the observed I.
-Y = [np.zeros(1), np.zeros(1), np.zeros(1)]
-arr = burned_trace.posterior.mean(dim="draw")
-arr['I_mu'] = arr.I_mu.rename({'chain':'chain', 'I_mu_dim_0':'days_since_origin'})
-arr['S_mu'] = arr.S_mu.rename({'chain':'chain', 'S_mu_dim_0':'days_since_origin'})
-Y[0] = arr['I_mu']
-Y[1] = arr['S_mu']
-Y[2] = 1-Y[0]-Y[1]
+arr = burned_trace.posterior.mean(dim='draw')
+arr_obs = trace.observed_data
+# arr = burned_trace_post.mean(dim='draw')
+Y = [np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1)]
+arr['I_new'] = arr.I_new.rename({'chain':'chain', 'I_new_dim_0':'days_since_origin'})
+arr['S'] = arr.S.rename({'chain':'chain', 'S_dim_0':'days_since_origin'})
+arr['H_new'] = arr.H_new.rename({'chain':'chain', 'H_new_dim_0':'days_since_origin'})
+arr['R'] = arr.R.rename({'chain':'chain', 'R_dim_0':'days_since_origin'})
+# Y[0] = arr['new_cases']
+Y[0] = arr['I_new']
+Y[1] = arr['S']
+# Y[2] = arr['new_admissions']
+Y[2] = arr['H_new']
+Y[3] = arr['R']
 # Yc = [  [ Y[y][c,:] for y in range(len(Y)) ] for c in range(2) ]
-
+max_x_range = len(daterange)-1
+x_ax_range = np.linspace(1,max_x_range, max_x_range)
 # now plot using dates as x, and I, S and R on the y-axis (Y[0], Y[1] and Y[2])
-plt.plot(daterange, Y[0][0], "o--", label="I")
-plt.plot(daterange, Y[1][0], "o--", label="S")
-plt.plot(daterange, Y[2][0], "o--", label="R")
-plt.plot(daterange, cases_obs, "x--", label="I_obs")
-plt.ylim(0.000,0.1)
+plt.plot(x_ax_range, Y[0][1], "o--", label="new infections")
+plt.plot(x_ax_range, Y[1][1], "o--", label="Susceptible")
+plt.plot(x_ax_range, Y[2][1], "o--", label="new admissions")
+plt.plot(x_ax_range, Y[3][1], "o--", label="Removed")
+plt.plot(x_ax_range, arr_obs['new_cases'], "x--", label="I_obs_new")
+plt.plot(x_ax_range, arr_obs['new_admissions'], "x--", label="H_obs_new")
+plt.ylim(0.000,0.001)
 plt.legend(fontsize=12)
 
 plt.show()
 
-burned_trace.to_netcdf("burned_trace_output_saved_on_disk_run2.nc")
-Y[0].to_netcdf("I_output_saved_on_disk_run2.nc")
+#Y[0].to_netcdf("I_output_saved_on_disk_run3.nc")
 
 print('this is the end')
