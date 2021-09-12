@@ -7,6 +7,8 @@ import arviz as az
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib import pyplot as plt
+import xarray as xa
+from netCDF4 import Dataset
 
 """
 ---------------------------------------------------------------------------------
@@ -69,6 +71,8 @@ def SIHR(beta, lam, gamma, delta, S_t_init, I_t_init, H_t_init):
         S_t = S_prev_t - I_new
         H_t = H_new + H_prev_t - delta*H_prev_t
         return S_t, I_t, H_t, I_new, H_new
+    # sequences is the 'list' that the theano loop iterates over similar to how python loops over an array len(array) times. Beta is a tensor of ndays elements with each taking the value of the current beta RV equiv.
+    # outputs_info accumulates results. It indicates to 'scan' that the results from the prior iteration for these variables need to be passed to increment_t.
     outputs, _ = ae.scan(fn=increment_t, sequences=[beta], outputs_info=[S_t_init, I_t_init, H_t_init, I_new_init, H_new_init])
     S_t_all, I_t_all, H_t_all, I_new_all, H_new_all = outputs
     return S_t_all, I_t_all, H_t_all, I_new_all, H_new_all
@@ -83,12 +87,9 @@ daterange = pd.date_range(start="2020-08-26", end="2020-11-13")
 ndays = len(daterange.day)
 covid_case_obj = COVID_case_data(daterange)                      # Make a function to extract case data when given a country code argument
 covid_hosp_obj = COVID_hosp_data(daterange)
-# endtime = dt.date(2020,11,13)
-# starttime = dt.date(2020,8,26)
-# test_tau = dt.timedelta(days=10)
 
-n_samples = 800
-n_tune = 200
+n_samples = 1000
+n_tune = 1000
 N = 67000000                                                     # Population of UK
 tau = 10                                                         # Num days people remain in infectious compartment, used for rough estimate of I_initial from cases[0]
 I_initial = get_initial_I(tau, covid_case_obj, daterange) / N     # From observed data, takes the case numbers of the tau days prior to startdate.
@@ -107,12 +108,12 @@ prior = {   'beta_mu': (1.2),
             'delta_sig': (0.02),
             'lam_mu': (0.5),
             'lam_sig': (0.05),
-            'S_t_init_mu': (S_initial),
-            'S_t_init_sig': (0.005),
+            'S_t_init_mu': S_initial,
+            'S_t_init_sig': 0.05*(1-S_initial),
             'I_t_init_mu': (I_initial),
-            'I_t_init_sig': (0.00003),
+            'I_t_init_sig': I_initial*0.04,
             'H_t_init_mu': (H_initial),
-            'H_t_init_sig': (0.000005)
+            'H_t_init_sig': H_initial*0.04
         }
 
 
@@ -125,6 +126,8 @@ with pm.Model() as model:
 
     I_t_init = pm.Normal("I_t_init", prior['I_t_init_mu'], prior['I_t_init_sig'])
     H_t_init = pm.Normal("H_t_init", prior['H_t_init_mu'], prior['H_t_init_sig'])
+    #R_t_init = pm.Normal("R_t_init", R_initial, R_initial*0.01)
+    #S_t_init_mu = pm.Deterministic("S_t_init_mu", 1-I_t_init-H_t_init-R_t_init)
     S_t_init = pm.Normal("S_t_init", prior['S_t_init_mu'], prior['S_t_init_sig'])    # N is equal to 1, R will be > 0 if the daterange starts after the beginning of first wave
 
     # sigma = pm.HalfCauchy('sigma', likelihood['sigma'])
@@ -134,17 +137,17 @@ with pm.Model() as model:
     lam = pm.Normal('lambda', prior['lam_mu'], prior['lam_sig'])
     gamma = pm.Normal('gamma', prior['gamma_mu'], prior['gamma_sig'])
     delta = pm.Normal('delta', prior['delta_mu'], prior['delta_sig'])
-    case_obs_err = pm.HalfCauchy('case_obs_err', beta=0.00005)    # RV for error in case collection figures
-    adm_obs_err = pm.HalfCauchy('adm_obs_err', beta=0.000005)      # RV for error in hospital admissions figures
+    # case_obs_err = pm.HalfCauchy('case_obs_err', beta=0.00005)    # RV for error in case collection figures
+    # adm_obs_err = pm.HalfCauchy('adm_obs_err', beta=0.000005)      # RV for error in hospital admissions figures
 
     S, I, H, I_new, H_new = SIHR(beta=beta * aet.ones(ndays-1), lam=lam, 
-                                               gamma=gamma, delta=delta, S_t_init=S_t_init, I_t_init=I_t_init , 
+                                               gamma=gamma, delta=delta, S_t_init=S_t_init, I_t_init=I_t_init, 
                                                H_t_init=H_t_init)
 
 
 # nu should be roughly equivalent to the (number of samples) / (number of days in the daterange) - 1
-    new_cases = pm.StudentT('new_cases', nu=4, mu=I_new, sigma=case_obs_err*(I_new), observed=cases_obs)
-    new_admissions = pm.StudentT('new_admissions', nu=4, mu=H_new, sigma=adm_obs_err*(H_new), observed=hosp_admissions_obs)
+    new_cases = pm.StudentT('new_cases', nu=4, mu=I_new, sigma=0.03*(I_new), observed=cases_obs)
+    new_admissions = pm.StudentT('new_admissions', nu=4, mu=H_new, sigma=0.03*(H_new), observed=hosp_admissions_obs)
 
     S = pm.Deterministic('S', S)
     I = pm.Deterministic('I', I)
@@ -155,25 +158,27 @@ with pm.Model() as model:
 
     R0 = pm.Deterministic('R0',beta/lam)
 
-    # # Checks on priors (run first 4 lines within model, next 3 from debug console)
+    # Checks on priors (run first 4 lines within model, next 3 from debug console)
     # RANDOM_SEED = 8157
     # np.random.seed(286)
-    # prior_checks = pm.sample_prior_predictive(random_seed=RANDOM_SEED)
+    # prior_checks = pm.sample_prior_predictive(random_seed=RANDOM_SEED)      # takes a minute or so to run
     # interdata_prior = az.from_pymc3(prior=prior_checks)
     
-    # _, ax = plt.subplots()
-    # interdata_prior.prior.plot.scatter(x="new_admissions", y="adm_obs_err", ax=ax)
-    # plt.show()
+    # # _, ax = plt.subplots()
+    # # interdata_prior.prior.plot.scatter(x="new_admissions", y="adm_obs_err", ax=ax)
+    # # plt.show()
 
     # Sampling
-    #step = pm.Metropolis()
-    # step1 = pm.NUTS(target_accept=0.5, step_scale=0.1)    # still too slow
-    # step1 = pm.NUTS(adapt_step_size=False, step_scale=0.2)
+    step = pm.Metropolis()
+    # step = pm.NUTS()    # still too slow
+    # step1 = pm.NUTS(adapt_step_size=False)
     # trace = pm.sample(n_samples, step=step1, chains=2, tune=n_tune, cores=8 
-    trace = pm.sample(n_samples, chains=1, tune=n_tune, cores=8)
+    trace = pm.sample(draws=n_samples, tune=n_tune, step=step, chains=2, cores=8)
 
+trace.to_netcdf("raw_discretised_05.nc")
 burned_trace = trace.isel(draw=slice(int(n_samples/4),-1))
-burned_trace.to_netcdf("discretised_01.nc")
+burned_trace.to_netcdf("discretised_05.nc")
+final_trace = burned_trace.isel(draw=slice(int(n_samples*.99),-1))
 
 """
 ----------------------------------------------------------------------------------
@@ -181,25 +186,30 @@ Plotting & Saving
 ----------------------------------------------------------------------------------
 """
 # Extract I, S, R values as an average at each timepoint from the burned trace and plot with the observed I.
-arr = burned_trace.posterior.mean(dim="draw")
+arr = burned_trace.posterior.mean(dim='draw')
+arr_obs = trace.observed_data
+# arr = burned_trace_post.mean(dim='draw')
 Y = [np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1)]
-# arr['I_mu'] = arr.I_mu.rename({'chain':'chain', 'I_mu_dim_0':'days_since_origin'})
-# arr['S_mu'] = arr.S_mu.rename({'chain':'chain', 'S_mu_dim_0':'days_since_origin'})
-# arr['H_mu'] = arr.H_mu.rename({'chain':'chain', 'H_mu_dim_0':'days_since_origin'})
-Y[0] = arr['new_cases']
+arr['I_new'] = arr.I_new.rename({'chain':'chain', 'I_new_dim_0':'days_since_origin'})
+arr['S'] = arr.S.rename({'chain':'chain', 'S_dim_0':'days_since_origin'})
+arr['H_new'] = arr.H_new.rename({'chain':'chain', 'H_new_dim_0':'days_since_origin'})
+arr['R'] = arr.R.rename({'chain':'chain', 'R_dim_0':'days_since_origin'})
+# Y[0] = arr['new_cases']
+Y[0] = arr['I_new']
 Y[1] = arr['S']
-Y[2] = arr['new_admissions']
+# Y[2] = arr['new_admissions']
+Y[2] = arr['H_new']
 Y[3] = arr['R']
 # Yc = [  [ Y[y][c,:] for y in range(len(Y)) ] for c in range(2) ]
 max_x_range = len(daterange)-1
 x_ax_range = np.linspace(1,max_x_range, max_x_range)
 # now plot using dates as x, and I, S and R on the y-axis (Y[0], Y[1] and Y[2])
-plt.plot(x_ax_range, Y[0][0], "o--", label="new infections")
-plt.plot(x_ax_range, Y[1][0], "o--", label="Susceptible")
-plt.plot(x_ax_range, Y[2][0], "o--", label="new admissions")
-plt.plot(x_ax_range, Y[3][0], "o--", label="Removed")
-plt.plot(x_ax_range, cases_obs, "x--", label="I_obs_new")
-plt.plot(x_ax_range, hosp_admissions_obs, "x--", label="H_obs_new")
+plt.plot(x_ax_range, Y[0][1], "o--", label="new infections")
+plt.plot(x_ax_range, Y[1][1], "o--", label="Susceptible")
+plt.plot(x_ax_range, Y[2][1], "o--", label="new admissions")
+plt.plot(x_ax_range, Y[3][1], "o--", label="Removed")
+plt.plot(x_ax_range, arr_obs['new_cases'], "x--", label="I_obs_new")
+plt.plot(x_ax_range, arr_obs['new_admissions'], "x--", label="H_obs_new")
 plt.ylim(0.000,0.001)
 plt.legend(fontsize=12)
 
