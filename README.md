@@ -1,13 +1,13 @@
 # covid-wave
-A SIR+H (H=hospital admissions compartment) model of UK SARS-CoV2 spread in the UK.
+A SIR+H (H=hospital admissions compartment) model of SARS-CoV2 spread in the UK.
 
 A work in progress.
 
-Performs bayesian inference against observed new daily case and hospital admissions data using PyMC3's NUTS (v slow but more accurate) or Metropolis (faster) samplers.
+Performs bayesian inference against observed new daily case and hospital admissions data using PyMC3's NUTS sampler.
 
 Future dev:
 
-- Determine cause of gradient error during sampling with NUTS + theano loop.
+- <strike>Determine cause of gradient error during sampling with NUTS + theano loop.</strike>
 - Add switchpoints to SIRH model to extend inference across longer daterange.
 - Account for vaccinations.
 
