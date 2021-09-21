@@ -8,7 +8,8 @@ Performs bayesian inference against observed new daily case and hospital admissi
 Future dev:
 
 - <strike>Determine cause of gradient error during sampling with NUTS + theano loop.</strike>
-- Add switchpoints to SIRH model to extend inference across longer daterange.
+- Add switchpoint functionality to SIRH model to extend inference across longer daterange.
+- Associate switchpoints to policy change dates.
 - Account for vaccinations.
 
 		
