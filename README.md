@@ -18,4 +18,5 @@ Future dev:
 
 Credit to https://github.com/Priesemann-Group/covid_bayesian_mcmc for the idea of using a theano scan function to implement the recurrence equations.
 
-Data sources: https://coronavirus.data.gov.uk/details/healthcare
+Data sources: 	Daily cases and hsopital admissions: https://coronavirus.data.gov.uk/details/healthcare
+		UK policy indices: https://github.com/OxCGRT/covid-policy-tracker/blob/master/data/OxCGRT_latest.csv
