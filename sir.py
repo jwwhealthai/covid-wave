@@ -1,3 +1,4 @@
+from datetime import datetime
 import aesara as ae
 import aesara.tensor as aet
 import pymc3 as pm
@@ -16,19 +17,36 @@ Define data wrangling functions
 ---------------------------------------------------------------------------------
 """
 # Data extraction function:
-def COVID_case_data(daterange):
-    raw_data_c = pd.read_csv("data/cases/data_2021-Jul-13.csv") # 'newCasesByPublishDate'
+def COVID_pol_data():
+    try:
+        raw_OxCGRT = pd.read_csv("data/policy/OxCGRT_latest.csv")
+    except:
+        "Policy data is not loading. Check that it's a valid csv file."
+    raw_data_p =raw_OxCGRT.loc[(raw_OxCGRT['CountryCode']=='GBR')&(raw_OxCGRT['Jurisdiction']=='NAT_TOTAL')][['Date','StringencyIndex']]
+    raw_data_p['Date'] = pd.to_datetime(raw_data_p['Date'], format="%Y%m%d")
+    policy_ind = raw_data_p.dropna().reset_index().dropna().drop(columns='index')
+    return policy_ind
+
+def COVID_case_data():
+    try:
+        raw_data_c = pd.read_csv("data/cases/data_2021-Jul-13.csv") # 'newCasesByPublishDate'
+    except:
+        "Covid case incidence data is not loading. Check that it's a valid csv file."
     raw_data_c['date_new'] = pd.to_datetime(raw_data_c['date'])         # coerces date column to datetime
     raw_data_c = raw_data_c.sort_values(by='date_new' , axis='index')   # sorts so that earliest date appears first
     cases = raw_data_c[['newCasesByPublishDate','date_new']]          # makes dataframe of date and cases columns
     cases = cases.reset_index()
     return cases
 
-def COVID_hosp_data(daterange):
-    raw_data_h = pd.read_csv("data/hosp/data_2021-Jun-17.csv") # 'newAdmissions'
+def COVID_hosp_data():
+    try:
+        raw_data_h = pd.read_csv("data/hosp/data_2021-Jun-17.csv") # 'newAdmissions'
+    except:
+        "Covid hospitalisation incidence data is not loading. Check that it's a valid csv file."
     raw_data_h['date_new'] = pd.to_datetime(raw_data_h['date'])         # coerces date column to datetime
     raw_data_h = raw_data_h.sort_values(by='date_new' , axis='index')   # sorts so that earliest date appears first
     tmp_data_h = raw_data_h.groupby(by=[raw_data_h.date_new], as_index=False).sum()     # groups 4 nations data by date and sums admissions
+    assert tmp_data_h.shape(0) < raw_data_h.shape(0), "Raw hospitalisation dataset is the same length or longer than it is after grouping all 4 nations by date and aggregating. Something must be wrong with the input data or grouping code."
     admissions = tmp_data_h[['newAdmissions','date_new']]          # makes dataframe of date and admissions columns
     admissions = admissions.reset_index()
     return admissions
@@ -41,14 +59,18 @@ def infectious_duration(tau):
     return res
 
 def get_initial_I(tau, covid_case_obj, daterange):
-    I_initial = np.sum(covid_case_obj.iloc[(covid_case_obj.index[covid_case_obj.date_new==daterange[0]].values[0] - infectious_duration(tau)) : covid_case_obj.index[covid_case_obj.date_new==daterange[0]].values[0]+1]['newCasesByPublishDate'])
+    I_initial_disagg = covid_case_obj.iloc[(covid_case_obj.index[covid_case_obj.date_new==daterange[0]].values[0] - infectious_duration(tau)) : covid_case_obj.index[covid_case_obj.date_new==daterange[0]].values[0]+1]['newCasesByPublishDate']
+    assert I_initial_disagg.shape[0] == len(daterange.day)+tau, "I_initial not considering the right number of days of infections"
+    I_initial = np.sum(I_initial_disagg)
     # I0 = pd.Series(I_initial)
     # I0.name = 'I0'
     # I0 = covid_case_obj.loc[(covid_case_obj['date_new'] > starttime - dt.timedelta(days=tau)) & (covid_case_obj['date_new'] <= starttime)]['newCasesByPublishDate']
     return I_initial
 
 def get_initial_H(tau, covid_hosp_obj, daterange):
-    H_initial = np.sum(covid_hosp_obj.iloc[(covid_hosp_obj.index[covid_hosp_obj.date_new==daterange[0]].values[0] - infectious_duration(tau)) : covid_hosp_obj.index[covid_hosp_obj.date_new==daterange[0]].values[0]+1]['newAdmissions'])
+    H_initial_disagg = covid_hosp_obj.iloc[(covid_hosp_obj.index[covid_hosp_obj.date_new==daterange[0]].values[0] - infectious_duration(tau)) : covid_hosp_obj.index[covid_hosp_obj.date_new==daterange[0]].values[0]+1]['newAdmissions']
+    assert H_initial_disagg.shape[0] == len(daterange.day)+tau, "H_initial not considering the right number of days of hospitalisations"
+    H_initial = np.sum(H_initial_disagg)
     return H_initial
 
 """
@@ -83,10 +105,19 @@ def SIHR(beta, lam, gamma, delta, S_t_init, I_t_init, H_t_init, N):
 Configuration settings, parameter priors etc.
 ---------------------------------------------------------------------------------
 """
-daterange = pd.date_range(start="2020-03-15", end="2020-04-02")
+start = "2020-03-15"
+end = "2020-04-02"
+daterange = pd.date_range(start=start, end=end)
 ndays = len(daterange.day)
-covid_case_obj = COVID_case_data(daterange)                      # Make a function to extract case data when given a country code argument
-covid_hosp_obj = COVID_hosp_data(daterange)
+covid_case_obj = COVID_case_data()                      # Make a function to extract case data when given a country code argument
+covid_hosp_obj = COVID_hosp_data()
+covid_poli_obj = COVID_pol_data()
+
+# Some tests to ensure data integrity during dev
+assert covid_case_obj['date_new'][0] < covid_case_obj['date_new'][-1], 'first date in index is not earlier than last, there must be a sorting or indexing issue.'
+assert covid_hosp_obj['date_new'][0] < covid_hosp_obj['date_new'][-1], 'first date in index is not earlier than last, there must be a sorting or indexing issue.'
+assert covid_poli_obj['date'][0] < covid_poli_obj['date'][-1], 'first date in index is not earlier than last, there must be a sorting or indexing issue.'
+assert len(pd.date_range(covid_poli_obj['date'][0], covid_poli_obj['date'][-1])) == covid_poli_obj.shape[0], 'daterange of policy date is not equal to its number of rows, suggesting there are missing dates or a grouping issue (ought to be 1 row per daily date)'
 
 n_samples = 400
 n_tune = 1000
@@ -99,21 +130,27 @@ R_initial = np.sum(covid_case_obj.loc[covid_case_obj['date_new']<= daterange[0]-
 S_initial = (N - R_initial - I_initial - H_initial)   # All cases removed before startdate-tau incl in R_initial. Infected or hospitalised cases within startdate-tau also need to subtracted.
 cases_obs = covid_case_obj.loc[(covid_case_obj['date_new'] >= daterange[0]) & (covid_case_obj['date_new'] < daterange[-1])]['newCasesByPublishDate']
 hosp_admissions_obs = covid_hosp_obj.loc[(covid_hosp_obj['date_new'] >= daterange[0]) & (covid_hosp_obj['date_new'] < daterange[-1])]['newAdmissions']
+policy_obs = covid_poli_obj.loc[(covid_poli_obj['Date'] >= daterange[0]) & (covid_poli_obj['Date'] < daterange[-1])]['StringencyIndex']
 
-prior = {   'beta_mu': np.log(2/5),
-            'beta_sig': (0.5),
-            'gamma_mu': np.log(1/10),
-            'gamma_sig': (0.5),
+prior = {   'scale_mu': np.log(0.02),
+            'scale_sig': 0.02,
+            'beta_pol_sig': 0.3,
+            'beta_inf_mu': np.log(0.5),
+            'beta_inf_sig': (0.25),
+            'gamma_mu': np.log(5/100),
+            'gamma_sig': (0.05),
             'delta_mu': np.log(1/12),
             'delta_sig': (0.4),
-            'lam_mu': np.log(1/8),
-            'lam_sig': (0.5),
-            'S_t_init_mu': np.log(S_initial),
-            'S_t_init_sig': 0.03,
+            'lam_mu': np.log(1/20),
+            'lam_sig': (0.05),
+            'S_t_init_mu': np.log(S_initial-1000),
+            'S_t_init_sig': (S_initial/(S_initial-500))-1,
             'I_t_init_mu': np.log(I_initial),
-            'I_t_init_sig': 0.9,
+            'I_t_init_sig': (0.09),
             'H_t_init_mu': np.log(H_initial),
-            'H_t_init_sig': 0.3
+            'H_t_init_sig': (0.03),
+            'I_obs_err_mu': np.log(1.5),
+            'I_obs_err_sig':0.9
         }
 
 
@@ -124,30 +161,29 @@ Perform SIHR modelling on waves 1 and 2
 """
 with pm.Model() as model:
 
-    I_t_init = pm.LogNormal("I_t_init", prior['I_t_init_mu'], prior['I_t_init_sig'])
-    H_t_init = pm.LogNormal("H_t_init", prior['H_t_init_mu'], prior['H_t_init_sig'])
+    I_t_init = pm.LogNormal("I_t_init", prior['I_t_init_mu'], prior['I_t_init_sig'], initval=I_initial)
+    H_t_init = pm.LogNormal("H_t_init", prior['H_t_init_mu'], prior['H_t_init_sig'], initval=H_initial)
     #R_t_init = pm.Normal("R_t_init", R_initial, R_initial*0.01)
     #S_t_init_mu = pm.Deterministic("S_t_init_mu", 1-I_t_init-H_t_init-R_t_init)
-    S_t_init = pm.LogNormal("S_t_init", prior['S_t_init_mu'], prior['S_t_init_sig'])    # N is equal to 1, R will be > 0 if the daterange starts after the beginning of first wave
+    S_t_init = pm.LogNormal("S_t_init", prior['S_t_init_mu'], prior['S_t_init_sig'], initval=S_initial)    # N is equal to 1, R will be > 0 if the daterange starts after the beginning of first wave
 
-    # sigma = pm.HalfCauchy('sigma', likelihood['sigma'])
-    # sigma_h = pm.HalfCauchy('sigma_h', likelihood['sigma_h'])
-    # H_sigma = pm.HalfCauchy('H_sigma', likelihood['H_sigma'])
-    beta = pm.LogNormal('beta', prior['beta_mu'], prior['beta_sig'])     # lognormal might not be appropriate
+    beta_pol = pm.LogNormal('beta_pol', mu=np.log(policy_obs).to_numpy(), sigma=prior['beta_pol_sig'])
+    scale = pm.LogNormal('scale', mu=prior['scale_mu'], sigma=prior['scale_sig'])
+    policy_factor = pm.Deterministic('policy_factor', beta_pol*scale)
+    beta_inf = pm.LogNormal('beta_inf', prior['beta_inf_mu'], prior['beta_inf_sig'])
+    beta = pm.Deterministic('beta', beta_inf/policy_factor)         # A low stringency level (i.e. below 1) will increase infection rate, whereas stringency above 1 will reduce it. 
     lam = pm.LogNormal('lambda', prior['lam_mu'], prior['lam_sig'])
     gamma = pm.LogNormal('gamma', prior['gamma_mu'], prior['gamma_sig'])
     delta = pm.LogNormal('delta', prior['delta_mu'], prior['delta_sig'])
+    # I_obs_err = pm.LogNormal('I_obs_err', prior['I_obs_err_mu'], prior['I_obs_err_sig'])
     # case_obs_err = pm.HalfCauchy('case_obs_err', beta=0.00005)    # RV for error in case collection figures
     # adm_obs_err = pm.HalfCauchy('adm_obs_err', beta=0.000005)      # RV for error in hospital admissions figures
-
     S, I, H, I_new, H_new = SIHR(beta=beta * aet.ones(ndays-1), lam=lam, 
                                                gamma=gamma, delta=delta, S_t_init=S_t_init, I_t_init=I_t_init, 
                                                H_t_init=H_t_init, N=N)
-
-
-# re:student ttest: nu should be roughly equivalent to the (number of samples) / (number of days in the daterange) - 1
-    new_cases = pm.StudentT('new_cases', nu=4, mu=I_new, sigma=I_new, observed=cases_obs)
-    new_admissions = pm.StudentT('new_admissions', nu=4, mu=H_new, sigma=1, observed=hosp_admissions_obs)
+    # re:student ttest: nu should be roughly equivalent to the (number of samples) / (number of days in the daterange) - 1
+    new_cases = pm.StudentT('new_cases', nu=4, mu=I_new, sigma=.5*I_new, observed=cases_obs)
+    new_admissions = pm.StudentT('new_admissions', nu=4, mu=H_new, sigma=0.5, observed=hosp_admissions_obs)
 
     S = pm.Deterministic('S', S)
     I = pm.Deterministic('I', I)
@@ -170,14 +206,14 @@ with pm.Model() as model:
 
     # Sampling
     # step = pm.Metropolis()
-    # step = pm.NUTS()    # still too slow
+    step = pm.NUTS()    
     # step1 = pm.NUTS(adapt_step_size=False)
     # trace = pm.sample(n_samples, step=step1, chains=2, tune=n_tune, cores=8 
-    trace = pm.sample(draws=n_samples, tune=n_tune, chains=2, cores=8)
+    trace = pm.sample(draws=n_samples, step=step, init='adapt_diag', tune=n_tune, chains=2, cores=8)
 
-trace.to_netcdf("raw_discretised_10.nc")
+trace.to_netcdf("raw_discretised_24.nc")
 burned_trace = trace.isel(draw=slice(int(n_samples/4),-1))
-burned_trace.to_netcdf("discretised_10.nc")
+burned_trace.to_netcdf("discretised_24.nc")
 final_trace = burned_trace.isel(draw=slice(int(n_samples*.99),-1))
 
 """
@@ -193,29 +229,36 @@ arr = burned_trace_post.mean(dim='draw')
 # arr = raw_trace_post.isel(draw=slice(-2, -1))
 # arr = arr.mean(dim='draw')
 arr_obs = trace_obs
-Y = [np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1)]
+Y = [np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1)]
 arr['I_new'] = arr.I_new.rename({'chain':'chain', 'I_new_dim_0':'days_since_origin'})
 arr['S'] = arr.S.rename({'chain':'chain', 'S_dim_0':'days_since_origin'})
 arr['H_new'] = arr.H_new.rename({'chain':'chain', 'H_new_dim_0':'days_since_origin'})
 arr['R'] = arr.R.rename({'chain':'chain', 'R_dim_0':'days_since_origin'})
+arr['I'] = arr.I.rename({'chain':'chain', 'I_dim_0':'days_since_origin'})
+arr['H'] = arr.H.rename({'chain':'chain', 'H_dim_0':'days_since_origin'})
 # Y[0] = arr['new_cases']
 Y[0] = arr['I_new']
 Y[2] = arr['S']
 # Y[2] = arr['new_admissions']
 Y[1] = arr['H_new']
 Y[3] = arr['R']
+Y[4] = arr['I']
+Y[5] = arr['H']
 # daterange = pd.date_range(start='2020-05-09', end='2020-06-01', freq='D')
 max_x_range = len(daterange)-1
 x_ax_range = np.linspace(1,max_x_range, max_x_range)
 # now plot using dates as x, and I, S and R on the y-axis (Y[0], Y[1] and Y[2])
-plt.plot(x_ax_range, Y[0][0], "o--", label="new infections")
-plt.plot(x_ax_range, Y[1][0], "o--", label="new admissions")
+plt.plot(x_ax_range, Y[0][1], "o--", label="new infections1")
+plt.plot(x_ax_range, Y[1][1], "o--", label="new admissions1")
 plt.plot(x_ax_range, Y[2][0], "o--", label="Susceptible")
 plt.plot(x_ax_range, Y[3][0], "o--", label="Removed")
+plt.plot(x_ax_range, Y[4][0], "o--", label="Current infection level")
+plt.plot(x_ax_range, Y[5][0], "o--", label="Current hospitalised level")
+
 plt.plot(x_ax_range, arr_obs['new_cases'], "x--", label="I_obs_new")
 plt.plot(x_ax_range, arr_obs['new_admissions'], "x--", label="H_obs_new")
-# plt.ylim(0.000,0.001)
-plt.legend(fontsize=12)
+plt.ylim(0,10000)
+plt.legend(fontsize=8)
 
 plt.show()
 
