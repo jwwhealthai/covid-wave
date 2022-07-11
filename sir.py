@@ -119,6 +119,37 @@ def SIHR(beta, lam, gamma, delta, S_t_init, I_t_init, H_t_init, N):
 # N = aet.lscalar('N')
 # S, I, H, I_new, H_new = SIHR(beta = 1 * aet.ones(5), lam=1, gamma=1, delta=1, S_t_init=100, I_t_init=aet.dscalar(10), H_t_init=0, N=1000)
 
+def calc_beta_logistic(elap_days, policy_ch_matrix, theta_2, theta_3):
+    
+    def increment_d(elap_days, temp0, temp1 ):
+        beta_logistic = 1 / ( 1 + np.exp(-theta_2*(elap_days-theta_3)))
+        return beta_logistic
+   
+    results, updates = ae.scan(fn=increment_d, sequences=[elap_days], outputs_info=[None], non_sequences=[theta_2, theta_3])
+      
+    # TESTING results (i.e. impact %'s... should be a logistic curve with upper and lower asymptotes at 1 and 0 respectively and initial downward curve starting at 7th day):
+    
+    # 1. compile a function that links to the above scan process by declaring the same outputs and updates variables.
+    # 2. run the function with some test values, use an array of elapsed days and their corresponding policy changes with an arbitrary theta_2 (gradient at change) and theta_3 (delay) value.
+    # 3. check the values in a plot for now. In future, code a fixed set of test values and assert the answer as a unit test for this scan loop.
+    check = ae.function(inputs=[elap_days, theta_2, theta_3], outputs = results)
+    chk_results= check(np.array(list(reversed(range(1,21)))), 0.6, 7)
+    plt.plot(chk_results)
+    
+    
+    beta_log = aet.dot(results, policy_ch_matrix)
+    
+    # TESTING matrix multiplication for beta_log (can't use policy_ch_matrix directly as it's a shared variable and so its value is likely to change with diffenrent date ranges and policy adjustments, therefore used dummy values.)
+    test_policy_ch_matrix = aet.matrix('test_policy_ch_matrix')
+    test_beta_log = aet.dot(results, test_policy_ch_matrix)
+    f = ae.function([results, test_policy_ch_matrix], test_beta_log)
+    test_policy_ch_matrix_value = np.array( [[.1,.1,.1,.1],[.2,.2,.2,0],[.3,.3,0,0],[.5,0,0,0]] )
+    result_test_beta_log = f(  np.array([1,.98,.6,.01]), test_policy_ch_matrix_value )
+    assert result_test_beta_log.all() == np.array([0.481, 0.476, 0.296,0.1]).all(), 'Error in the matrix multiplication of the policy change matrix and the impact ""%"s. Check policy change matrix dimensions and the beta_logistic aesara function.'
+   
+    return beta_log
+
+
 """
 ---------------------------------------------------------------------------------
 Configuration settings, parameter priors etc.
@@ -157,6 +188,11 @@ S_initial = (N - R_initial - I_initial - H_initial)   # All cases removed before
 cases_obs = covid_case_obj.loc[(covid_case_obj['date_new'] >= daterange[0]) & (covid_case_obj['date_new'] < daterange[-1])]['newCasesByPublishDate']
 hosp_admissions_obs = covid_hosp_obj.loc[(covid_hosp_obj['date_new'] >= daterange[0]) & (covid_hosp_obj['date_new'] < daterange[-1])]['newAdmissions']
 policy_obs = covid_poli_obj.loc[(covid_poli_obj['date'] >= daterange[0]) & (covid_poli_obj['date'] < daterange[-1])]['StringencyIndex']
+policy_obs = policy_obs/100
+policy_obs_roll = np.roll(policy_obs,1)
+policy_obs_roll[0] = 0.0
+policy_changes = policy_obs - policy_obs_roll
+policy_ch_matrix = policy_changes.to_numpy().reshape(len(policy_changes),1) @ np.ones(len(policy_changes)).reshape(1,46) * np.fliplr(np.triu(np.ones(len(policy_changes)),k=0))
 
 def calc_logn_params(mu_est, sd_est):
     mu = np.log( mu_est**2 / np.sqrt(mu_est**2 + sd_est**2) )
@@ -164,7 +200,7 @@ def calc_logn_params(mu_est, sd_est):
     return dict(mu = mu, sig = sig)
 
 prior = {   'beta_int': calc_logn_params(0.5, 0.03),
-            'beta_grad': calc_logn_params(0.0035, 0.0002),
+            # 'beta_grad': calc_logn_params(0.0035, 0.0002),
             # 'scale_mu': np.log(0.02),
             # 'scale_sig': 0.02,
             # 'beta_pol_sig': 0.3,
@@ -175,7 +211,9 @@ prior = {   'beta_int': calc_logn_params(0.5, 0.03),
             'lam': calc_logn_params(0.15, 0.06),
             'S_t_init': calc_logn_params(S_initial-10000, S_initial*10**-5),
             'I_t_init': calc_logn_params(I_initial, 50),
-            'H_t_init': calc_logn_params(H_initial, 25)
+            'H_t_init': calc_logn_params(H_initial, 25),
+            'theta_2': calc_logn_params(0.10, 0.03),
+            'theta_3': calc_logn_params(14, 4)
             # 'I_obs_err_mu': 1.5,
             # 'I_obs_err_sig':0.9
         }
@@ -200,25 +238,28 @@ with pm.Model() as model:
     #S_t_init_mu = pm.Deterministic("S_t_init_mu", 1-I_t_init-H_t_init-R_t_init)
     S_t_init = pm.Lognormal("S_t_init", prior['S_t_init']['mu'], prior['S_t_init']['sig'])    # N is equal to 1, R will be > 0 if the daterange starts after the beginning of first wave
 
+    elap_days = pm.Deterministic('elap_days', np.array(list(reversed((range(1,ndays)))))*aet.ones(ndays-1))
+    policy_ch_matrix = ae.shared(policy_ch_matrix, 'policy_ch_matrix')
+    theta_2 = pm.Lognormal('theta_2', prior['theta_2']['mu'], prior['theta_2']['sig'])
+    theta_3 = pm.Lognormal('theta_3', prior['theta_3']['mu'], prior['theta_3']['sig'])
     beta_int = pm.Lognormal('beta_int', prior['beta_int']['mu'], prior['beta_int']['sig'])
-    beta_grad = pm.Lognormal('beta_grad', prior['beta_grad']['mu'], prior['beta_grad']['sig'])
-    beta = pm.Deterministic('beta', beta_int - (beta_grad * policy_obs.to_numpy()))
-    # beta_pol = pm.Lognormal('beta_pol', mu=np.log(policy_obs).to_numpy(), sigma=prior['beta_pol_sig'])
-    # scale = pm.Lognormal('scale', mu=prior['scale_mu'], sigma=prior['scale_sig'])
-    # policy_factor = pm.Deterministic('policy_factor', beta_pol*scale)
-    # beta_inf = pm.Lognormal('beta_inf', prior['beta_inf_mu'], prior['beta_inf_sig'])
-    # beta = pm.Deterministic('beta', beta_inf/policy_factor)         # A low stringency level (i.e. below 1) will increase infection rate, whereas stringency above 1 will reduce it. 
+
+    beta_logistic = calc_beta_logistic(elap_days = elap_days, policy_ch_matrix = policy_ch_matrix, theta_2 = theta_2, theta_3 = theta_3)
+
+    # beta_grad = pm.Lognormal('beta_grad', prior['beta_grad']['mu'], prior['beta_grad']['sig'])
+    beta = pm.Deterministic('beta', beta_int - beta_logistic)
+    
     lam = pm.Lognormal('lam', prior['lam']['mu'], prior['lam']['sig'])
     gamma = pm.Lognormal('gamma', prior['gamma']['mu'], prior['gamma']['sig'])
     delta = pm.Lognormal('delta', prior['delta']['mu'], prior['delta']['sig'])
     # I_obs_err = pm.Lognormal('I_obs_err', prior['I_obs_err_mu'], prior['I_obs_err_sig'])
     # case_obs_err = pm.HalfCauchy('case_obs_err', beta=0.00005)    # RV for error in case collection figures
     # adm_obs_err = pm.HalfCauchy('adm_obs_err', beta=0.000005)      # RV for error in hospital admissions figures
-    S, I, H, I_new, H_new = SIHR(beta=beta * aet.ones(ndays-1), lam=lam, 
+    S, I, H, I_new, H_new = SIHR(beta=beta, lam=lam, 
                                                gamma=gamma, delta=delta, S_t_init=S_t_init, I_t_init=I_t_init, 
                                                H_t_init=H_t_init, N=N)
     # re:student ttest: nu should be roughly equivalent to the (number of samples) / (number of days in the daterange) - 1
-    new_cases = pm.StudentT('new_cases', nu=4, mu=I_new, sigma=4000, observed=cases_obs)
+    new_cases = pm.StudentT('new_cases', nu=4, mu=I_new, sigma=10, observed=cases_obs)
     new_admissions = pm.StudentT('new_admissions', nu=4, mu=H_new, sigma=3, observed=hosp_admissions_obs)
 
     S = pm.Deterministic('S', S)
@@ -234,7 +275,7 @@ with pm.Model() as model:
     RANDOM_SEED = 8157
     # np.random.seed(286)
     prior_checks = pm.sample_prior_predictive(samples=50, random_seed=RANDOM_SEED)
-    # interdata_prior = az.from_pymc3(prior=prior_checks)
+    interdata_prior = az.from_pymc3(prior=prior_checks)
     
     # _, ax = plt.subplots()
     # interdata_prior.prior.plot.scatter(x="new_admissions", y="adm_obs_err", ax=ax)
@@ -247,9 +288,9 @@ with pm.Model() as model:
     # trace = pm.sample(n_samples, step=step1, chains=2, tune=n_tune, cores=8 
     trace = pm.sample(draws=n_samples, step=step, init='adapt_diag', tune=n_tune, chains=2, cores=1)
 
-trace.to_netcdf("raw_discretised_29.nc")
+trace.to_netcdf("raw_logistic_31.nc")
 burned_trace = trace.isel(draw=slice(int(n_samples/4),-1))
-burned_trace.to_netcdf("discretised_29.nc")
+burned_trace.to_netcdf("logistic_31.nc")
 final_trace = burned_trace.isel(draw=slice(int(n_samples*.99),-1))
 
 """
